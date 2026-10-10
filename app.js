@@ -48,6 +48,7 @@ const db = {
   },
   put(item) { return this.tx("readwrite", s => s.put(item)); },
   all() { return this.tx("readonly", s => s.getAll()); },
+  get(id) { return this.tx("readonly", s => s.get(id)); },
 };
 
 /* ---------- 画像 ---------- */
@@ -212,6 +213,7 @@ async function sendItem(item, retry = true) {
   const folderId = await getFolderId();
   const bookKey = `book_${folderId}_${year}`;
   // 画像アップロードと台帳の準備を同時に進める。台帳ID・月シートの有無は端末に覚えておき、2回目以降は検索を省く
+  const resumed = !!item.imageLink;   // 前回の送信が途中で止まった可能性がある
   const upload = item.imageLink ? Promise.resolve(item.imageLink) : (async () => {
     const safe = (d.store_name || "receipt").replace(/\s+/g, "_").replace(/[^\w\-]+/g, "").slice(0, 30) || "receipt";
     item.imageLink = await uploadImage(folderId, `${d.date.replace(/-/g, "")}_${safe}_${d.total ?? 0}.jpg`, item.image);
@@ -232,6 +234,13 @@ async function sendItem(item, retry = true) {
   const row = [d.date, d.store_name || "", d.store_name_original || "", text(d.tax_id), text(d.receipt_no), num(d.subtotal), num(d.vat),
     num(d.total), d.currency || "THB", d.payment_method || "", d.category || "その他", d.items_summary || "", d.memo || "",
     link, new Date().toLocaleString("sv-SE")];
+  if (resumed) {   // 画像リンクは1件ごとに固有。台帳に既にあれば、送信済みなので追記しない
+    const col = (await g(`${SHEETS}/${book}/values/${encodeURIComponent(`'${title}'!N:N`)}`)).values || [];
+    if (col.some(c => c[0] === link)) {
+      item.status = "done"; item.sheet = title; item.bookUrl = `https://docs.google.com/spreadsheets/d/${book}`;
+      await db.put(item); return;
+    }
+  }
   try {
     await g(`${SHEETS}/${book}/values/${encodeURIComponent(`'${title}'!A1`)}:append?valueInputOption=USER_ENTERED&insertDataOption=OVERWRITE`,
       jsonOpt("POST", { values: [row] }));
@@ -247,18 +256,28 @@ async function sendItem(item, retry = true) {
 /* ---------- 送信キュー ---------- */
 let syncing = false;
 async function sync() {
-  if (syncing) return; syncing = true;
+  if (syncing) return;
+  syncing = true; setBusy(true);
+  try {
+    // 複数のタブ/画面で同時に送信しないよう排他制御(対応していない環境では何もしない)
+    if (navigator.locks) await navigator.locks.request("receipt-sync", { ifAvailable: true }, lock => lock ? doSync() : msg("別の画面で送信中です", "info"));
+    else await doSync();
+  } finally { syncing = false; setBusy(false); await render(); }
+}
+function setBusy(b) { $("btnSync").disabled = b; $("btnLogin").disabled = b; }
+async function doSync() {
   try {
     const pend = (await db.all()).filter(i => i.status === "pending").sort((a, b) => a.id - b.id);
     const t0 = performance.now();
-    for (const it of pend) {
-      msg(`送信中… (${pend.indexOf(it) + 1}/${pend.length})`, "info");
-      await sendItem(it);
+    for (const p of pend) {
+      msg(`送信中… (${pend.indexOf(p) + 1}/${pend.length}) 画面を閉じずにお待ちください`, "info");
+      const it = await db.get(p.id);          // 直前に最新の状態を確認(他で送信済みなら飛ばす)
+      if (it && it.status === "pending") await sendItem(it);
     }
     if (pend.length) msg(`${pend.length}件を台帳に保存しました(${((performance.now() - t0) / 1000).toFixed(1)}秒)`, "ok");
   } catch (e) {
     msg(e instanceof AuthError ? e.message : "送信できませんでした: " + e.message, "err");
-  } finally { syncing = false; await render(); }
+  }
 }
 
 async function render() {
@@ -306,15 +325,22 @@ $("file").onchange = async e => {
 };
 $("btnCancel").onclick = () => { current = null; show("viewMain"); msg(""); };
 $("btnSave").onclick = async () => {
+  if ($("btnSave").disabled) return;
+  $("btnSave").disabled = true;
+  try { await saveReview(); } finally { $("btnSave").disabled = false; }
+};
+async function saveReview() {
   const data = {};
   for (const k of FIELDS) { const v = $(k).value.trim(); data[k] = NUMS.includes(k) ? (v === "" ? null : Number(v.replace(/,/g, ""))) : v; }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(data.date)) { msg("日付を YYYY-MM-DD 形式で入力してください", "err"); return; }
   if (NUMS.some(k => Number.isNaN(data[k]))) { msg("金額は数字で入力してください", "err"); return; }
+  const dup = (await db.all()).find(i => i.data.date === data.date && i.data.total === data.total && data.total != null);
+  if (dup && !confirm(`同じ日付・金額のレシートが既にあります(${dup.data.store_name})。\nもう一度保存しますか?`)) return;
   await db.put({ id: Date.now(), status: "pending", data, image: current.blob });
   current = null; show("viewMain"); msg("");
   await render();
   if (token()) await sync(); else msg("端末に保存しました。Googleにログインすると台帳へ送信されます", "info");
-};
+}
 $("btnSync").onclick = sync;
 $("btnLogin").onclick = login;
 

@@ -289,14 +289,34 @@ async function render() {
   $("btnSync").classList.toggle("hidden", !token());
   const list = $("list"); list.textContent = "";
   if (!items.length) list.innerHTML = "<small>まだありません</small>";
-  for (const it of items.slice(0, 50)) {
+  const itemRow = it => {
     const row = document.createElement("div"); row.className = "item";
     const l = document.createElement("div");
-    l.textContent = `${it.data.date}  ${it.data.store_name || "(店名なし)"}`;
+    l.textContent = `${it.data.date.slice(5)}  ${it.data.store_name || "(店名なし)"}`;
     const sub = document.createElement("small"); sub.style.display = "block";
     sub.textContent = `${it.data.total ?? "-"} ${it.data.currency || ""} ・ ${it.data.category}`; l.append(sub);
     const tag = document.createElement("span"); tag.className = "tag " + it.status;
-    tag.textContent = it.status === "done" ? "保存済み" : "未送信"; row.append(l, tag); list.append(row);
+    tag.textContent = it.status === "done" ? "保存済み" : "未送信"; row.append(l, tag); return row;
+  };
+  // 月ごとにまとめる(新しい月が上)。月の見出しをタップすると、その月の履歴が開く
+  const months = {};
+  for (const it of items) (months[it.data.date.slice(0, 7)] ||= []).push(it);
+  const openSet = new Set(JSON.parse(ls.get("open_months", "[]")));
+  const keys = Object.keys(months).sort().reverse();
+  if (keys.length && !openSet.size && !ls.get("open_months")) openSet.add(keys[0]);   // 初回は最新の月だけ開く
+  for (const k of keys) {
+    const list2 = months[k].sort((a, b) => b.data.date.localeCompare(a.data.date) || b.id - a.id);
+    const sum = list2.reduce((t, i) => t + (i.data.currency === "THB" || !i.data.currency ? Number(i.data.total) || 0 : 0), 0);
+    const det = document.createElement("details"); det.open = openSet.has(k);
+    const sm = document.createElement("summary");
+    sm.innerHTML = `<b></b><span></span>`;
+    sm.firstChild.textContent = `${k.slice(0, 4)}年${Number(k.slice(5))}月`;
+    sm.lastChild.textContent = `${list2.length}件 ・ ${sum.toLocaleString(undefined, { maximumFractionDigits: 2 })} THB`;
+    det.append(sm); list2.forEach(it => det.append(itemRow(it)));
+    det.addEventListener("toggle", () => {
+      det.open ? openSet.add(k) : openSet.delete(k); ls.set("open_months", JSON.stringify([...openSet]));
+    });
+    list.append(det);
   }
   const done = items.find(i => i.bookUrl);
   $("sheetLink").classList.toggle("hidden", !done); if (done) $("sheetLink").href = done.bookUrl;

@@ -51,13 +51,13 @@ const db = {
 };
 
 /* ---------- 画像 ---------- */
-async function prepareImage(file, maxEdge = 1800) {
+async function prepareImage(file, maxEdge = 1280) {
   const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
   const k = Math.min(1, maxEdge / Math.max(bmp.width, bmp.height));
   const c = document.createElement("canvas");
   c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
   c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
-  return new Promise(r => c.toBlob(r, "image/jpeg", 0.88));
+  return new Promise(r => c.toBlob(r, "image/jpeg", 0.85));
 }
 const blobToB64 = b => new Promise(r => { const f = new FileReader(); f.onload = () => r(f.result.split(",")[1]); f.readAsDataURL(b); });
 
@@ -94,7 +94,7 @@ async function readReceipt(jpeg) {
     method: "POST",
     headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01",
                "anthropic-dangerous-direct-browser-access": "true" },
-    body: JSON.stringify({ model: MODEL, max_tokens: 1500, tools: [TOOL], tool_choice: { type: "auto" },
+    body: JSON.stringify({ model: MODEL, max_tokens: 800, tools: [TOOL], tool_choice: { type: "auto" },
       messages: [{ role: "user", content: [
         { type: "image", source: { type: "base64", media_type: "image/jpeg", data: await blobToB64(jpeg) } },
         { type: "text", text: PROMPT }] }] }),
@@ -133,7 +133,7 @@ async function g(url, opt = {}) {
   const r = await fetch(url, { ...opt, headers: { Authorization: "Bearer " + t, ...(opt.headers || {}) } });
   if (r.status === 401) { ls.del("g_token"); throw new AuthError("ログインの有効期限が切れました"); }
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error?.message || "Google API エラー " + r.status);
+  if (!r.ok) { const e = new Error(j.error?.message || "Google API エラー " + r.status); e.status = r.status; throw e; }
   return j;
 }
 const jsonOpt = (method, body) => ({ method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -206,22 +206,40 @@ async function ensureMonthSheet(book, year, month) {
   return title;
 }
 
-async function sendItem(item) {
+async function sendItem(item, retry = true) {
   const d = item.data, [year, month] = d.date.split("-").map(Number);
+  const title = `${year}-${String(month).padStart(2, "0")}`;
   const folderId = await getFolderId();
-  if (!item.imageLink) {   // 画像アップロード済みなら再実行時に重複させない
+  const bookKey = `book_${folderId}_${year}`;
+  // 画像アップロードと台帳の準備を同時に進める。台帳ID・月シートの有無は端末に覚えておき、2回目以降は検索を省く
+  const upload = item.imageLink ? Promise.resolve(item.imageLink) : (async () => {
     const safe = (d.store_name || "receipt").replace(/\s+/g, "_").replace(/[^\w\-]+/g, "").slice(0, 30) || "receipt";
     item.imageLink = await uploadImage(folderId, `${d.date.replace(/-/g, "")}_${safe}_${d.total ?? 0}.jpg`, item.image);
-    await db.put(item);
-  }
-  const book = await findOrCreateBook(folderId, year);
-  const title = await ensureMonthSheet(book, year, month);
+    await db.put(item);   // 再送しても画像を重複させない
+    return item.imageLink;
+  })();
+  const prepare = (async () => {
+    let book = ls.get(bookKey);
+    if (!book) { book = await findOrCreateBook(folderId, year); ls.set(bookKey, book); }
+    const monthsKey = `months_${book}`, months = JSON.parse(ls.get(monthsKey, "[]"));
+    if (!months.includes(title)) { await ensureMonthSheet(book, year, month); months.push(title); ls.set(monthsKey, JSON.stringify(months)); }
+    return book;
+  })();
+  let book, link;
+  try { [book, link] = await Promise.all([prepare, upload]); }
+  catch (e) { await upload.catch(() => {}); throw e; }
   const text = v => v ? `'${v}` : "", num = v => typeof v === "number" ? v : "";
   const row = [d.date, d.store_name || "", d.store_name_original || "", text(d.tax_id), text(d.receipt_no), num(d.subtotal), num(d.vat),
     num(d.total), d.currency || "THB", d.payment_method || "", d.category || "その他", d.items_summary || "", d.memo || "",
-    item.imageLink, new Date().toLocaleString("sv-SE")];
-  await g(`${SHEETS}/${book}/values/${encodeURIComponent(`'${title}'!A1`)}:append?valueInputOption=USER_ENTERED&insertDataOption=OVERWRITE`,
-    jsonOpt("POST", { values: [row] }));
+    link, new Date().toLocaleString("sv-SE")];
+  try {
+    await g(`${SHEETS}/${book}/values/${encodeURIComponent(`'${title}'!A1`)}:append?valueInputOption=USER_ENTERED&insertDataOption=OVERWRITE`,
+      jsonOpt("POST", { values: [row] }));
+  } catch (e) {
+    // 台帳やシートが手動で削除された等でキャッシュが古い場合は、消して1回だけやり直す
+    if (retry && (e.status === 400 || e.status === 404)) { ls.del(bookKey); ls.del(`months_${book}`); return sendItem(item, false); }
+    throw e;
+  }
   item.status = "done"; item.sheet = title; item.bookUrl = `https://docs.google.com/spreadsheets/d/${book}`;
   await db.put(item);
 }
@@ -232,11 +250,12 @@ async function sync() {
   if (syncing) return; syncing = true;
   try {
     const pend = (await db.all()).filter(i => i.status === "pending").sort((a, b) => a.id - b.id);
+    const t0 = performance.now();
     for (const it of pend) {
       msg(`送信中… (${pend.indexOf(it) + 1}/${pend.length})`, "info");
       await sendItem(it);
     }
-    if (pend.length) msg(`${pend.length}件を台帳に保存しました`, "ok");
+    if (pend.length) msg(`${pend.length}件を台帳に保存しました(${((performance.now() - t0) / 1000).toFixed(1)}秒)`, "ok");
   } catch (e) {
     msg(e instanceof AuthError ? e.message : "送信できませんでした: " + e.message, "err");
   } finally { syncing = false; await render(); }
@@ -271,15 +290,17 @@ $("file").onchange = async e => {
   const f = e.target.files[0]; e.target.value = ""; if (!f) return;
   msg("読み取り中…(数秒かかります)", "info");
   try {
+    const t0 = performance.now();
     const blob = await prepareImage(f);
     const data = await readReceipt(blob);
+    const sec = ((performance.now() - t0) / 1000).toFixed(1);
     current = { blob };
     $("preview").src = URL.createObjectURL(blob);
     for (const k of FIELDS) { $(k).value = data[k] ?? ""; $(k).classList.remove("low"); }
     if (!$("currency").value) $("currency").value = "THB";
     if (data.confidence !== "high") for (const k of ["date", "total", "store_name"]) $(k).classList.add("low");
     show("viewReview");
-    msg(data.confidence === "high" ? "読み取り完了。内容を確認して保存してください" :
+    msg(data.confidence === "high" ? `読み取り完了(${sec}秒)。内容を確認して保存してください` :
       "読み取りに自信がない項目があります(赤枠)。画像と見比べて修正してください", data.confidence === "high" ? "ok" : "err");
   } catch (err) { msg(err.message, "err"); }
 };

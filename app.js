@@ -5,6 +5,7 @@
 const CATEGORIES = ["交通費", "食費", "宿泊費", "通信費", "消耗品", "接待交際費", "燃料費", "その他"];
 const SCOPES = "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/spreadsheets";
 const MODEL = "claude-sonnet-5-5";
+const DEFAULT_CLIENT_ID = "147145219163-c1fns1cd17raatbv3d27fv460j4bbn81.apps.googleusercontent.com";
 const SUMMARY_TITLE = "年合計";
 const HEADER = ["日付", "店名", "店名(原文)", "税ID", "レシート番号", "小計", "VAT", "合計", "通貨",
                 "支払方法", "カテゴリ", "内容", "メモ", "画像リンク", "登録日時"];
@@ -112,7 +113,7 @@ function token() {
   return t && Date.now() < exp - 60000 ? t : "";
 }
 function login() {
-  const cid = ls.get("client_id");
+  const cid = ls.get("client_id", DEFAULT_CLIENT_ID);
   if (!cid) { msg("設定(⚙︎)で Google クライアント ID を入力してください", "err"); return; }
   const p = new URLSearchParams({ client_id: cid, redirect_uri: redirectUri(), response_type: "token", scope: SCOPES,
     include_granted_scopes: "true", login_hint: ls.get("email"), prompt: "select_account" });
@@ -298,13 +299,13 @@ $("btnLogin").onclick = login;
 
 /* ---------- 設定 ---------- */
 $("btnSettings").onclick = () => {
-  $("setKey").value = ls.get("anthropic_key"); $("setClient").value = ls.get("client_id");
+  $("setKey").value = ls.get("anthropic_key"); $("setClient").value = ls.get("client_id", DEFAULT_CLIENT_ID);
   $("setEmail").value = ls.get("email", "tomonori19720629@gmail.com"); $("setFolder").value = ls.get("folder_name", "タイレシート経費精算");
   $("redirectUri").textContent = redirectUri(); show("viewSettings"); msg("");
 };
 $("btnSettingsBack").onclick = () => show("viewMain");
 $("btnSettingsSave").onclick = () => {
-  ls.set("anthropic_key", $("setKey").value.trim()); ls.set("client_id", $("setClient").value.trim());
+  ls.set("anthropic_key", $("setKey").value.trim()); ls.set("client_id", $("setClient").value.trim() || DEFAULT_CLIENT_ID);
   ls.set("email", $("setEmail").value.trim()); ls.set("folder_name", $("setFolder").value.trim() || "タイレシート経費精算");
   show("viewMain"); msg("設定を保存しました", "ok"); render();
 };
@@ -315,6 +316,6 @@ $("btnSettingsSave").onclick = () => {
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
   const back = takeTokenFromHash();
   await render();
-  if (!ls.get("anthropic_key") || !ls.get("client_id")) { msg("はじめに右上の ⚙︎ で API キーとクライアント ID を設定してください", "info"); }
+  if (!ls.get("anthropic_key")) { msg("はじめに右上の ⚙︎ で Anthropic の API キーを入力してください", "info"); }
   if (back) { msg("Googleにログインしました", "ok"); await sync(); }
 })();

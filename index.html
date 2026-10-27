@@ -61,7 +61,7 @@
 </style>
 </head>
 <body>
-<header><h1>🧾 レシート台帳(タイ)</h1><button id="btnSettings" aria-label="設定">⚙︎</button></header>
+<header><h1>🧾 レシート台帳</h1><button id="btnSettings" aria-label="設定">⚙︎</button></header>
 <main>
   <div id="msg"></div>
 
@@ -91,13 +91,17 @@
         <div><label>店名</label><input id="store_name"></div>
         <div><label>店名(原文)</label><input id="store_name_original"></div>
         <div><label>合計</label><input id="total" inputmode="decimal"></div>
-        <div><label>通貨</label><input id="currency"></div>
-        <div><label>小計(VAT抜き)</label><input id="subtotal" inputmode="decimal"></div>
-        <div><label>VAT</label><input id="vat" inputmode="decimal"></div>
-        <div><label>税ID</label><input id="tax_id" inputmode="numeric"></div>
+        <div><label>通貨(THB / JPY)</label><input id="currency" autocapitalize="characters"></div>
+        <div><label>小計(税抜)</label><input id="subtotal" inputmode="decimal"></div>
+        <div><label>VAT / 消費税</label><input id="vat" inputmode="decimal"></div>
+        <div><label>税ID / 登録番号</label><input id="tax_id"></div>
         <div><label>レシート番号</label><input id="receipt_no"></div>
         <div><label>支払方法</label><input id="payment_method"></div>
         <div><label>内容</label><input id="items_summary"></div>
+      </div>
+      <div id="fxBox" class="hidden">
+        <label id="fxLabel">レート</label><input id="fx_rate" inputmode="decimal">
+        <small id="fxThb" style="display:block;margin-top:4px"></small>
       </div>
       <label>メモ</label><input id="memo">
       <div class="row"><button id="btnSave">✅ 保存</button><button class="sub" id="btnCancel">破棄</button></div>
@@ -115,6 +119,9 @@
       <input id="setEmail" type="email" autocomplete="off">
       <label>保存先フォルダ名(マイドライブ直下。無ければ作成)</label>
       <input id="setFolder">
+      <h2 style="margin-top:18px">社内為替レート(日本円のレシート用)</h2>
+      <p class="sub-text">月ごとに「1バーツ = ○ 円」で入力します。空欄にして保存すると、欧州中央銀行の参考レート(月初の営業日)に戻ります。</p>
+      <div id="rateList"><small>読み込み中…</small></div>
       <p class="sub-text">リダイレクト URI(Google 側に登録する値): <br><b id="redirectUri"></b></p>
       <div class="row"><button id="btnSettingsSave">保存</button><button class="sub" id="btnSettingsBack">戻る</button></div>
     </div>

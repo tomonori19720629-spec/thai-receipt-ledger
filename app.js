@@ -8,11 +8,13 @@ const MODEL = "claude-sonnet-5-5";
 const DEFAULT_CLIENT_ID = "147145219163-c1fns1cd17raatbv3d27fv460j4bbn81.apps.googleusercontent.com";
 const SUMMARY_TITLE = "年合計";
 const HEADER = ["日付", "店名", "店名(原文)", "税ID", "レシート番号", "小計", "VAT", "合計", "通貨",
-                "支払方法", "カテゴリ", "内容", "メモ", "画像リンク", "登録日時"];
+                "支払方法", "カテゴリ", "内容", "メモ", "画像リンク", "登録日時",
+                "原通貨", "原通貨の金額", "レート(1THB=○原通貨)", "レート種別"];
+const RATE_SHEET = "為替レート";
 const COL_TOTAL = "H", COL_CATEGORY = "K";
 const FIELDS = ["date", "store_name", "store_name_original", "total", "currency", "subtotal", "vat", "tax_id",
-                "receipt_no", "payment_method", "items_summary", "memo", "category"];
-const NUMS = ["total", "subtotal", "vat"];
+                "receipt_no", "payment_method", "items_summary", "memo", "category", "fx_rate"];
+const NUMS = ["total", "subtotal", "vat", "fx_rate"];
 
 const $ = id => document.getElementById(id);
 const ls = {
@@ -66,26 +68,29 @@ const blobToB64 = b => new Promise(r => { const f = new FileReader(); f.onload =
 const TOOL = {
   name: "record_receipt", description: "レシートから読み取った内容を記録する",
   input_schema: { type: "object", properties: {
-    date: { type: ["string", "null"], description: "購入日 YYYY-MM-DD (西暦。仏暦なら543を引く)。読めなければnull" },
-    store_name: { type: "string", description: "店名。英語表記があれば英語、なければタイ語をそのまま" },
-    store_name_original: { type: "string", description: "レシート記載の店名そのまま(タイ語など)" },
-    tax_id: { type: "string", description: "税ID(13桁)。なければ空文字" },
+    date: { type: ["string", "null"], description: "購入日 YYYY-MM-DD (西暦。仏暦なら543を引く。和暦は西暦に直す)。読めなければnull" },
+    store_name: { type: "string", description: "店名。英語表記があれば英語、なければ原文(タイ語・日本語)をそのまま" },
+    store_name_original: { type: "string", description: "レシート記載の店名そのまま(タイ語・日本語など)" },
+    tax_id: { type: "string", description: "タイは税ID(13桁)、日本は登録番号(T+13桁)。なければ空文字" },
     receipt_no: { type: "string", description: "レシート/伝票番号。なければ空文字" },
-    subtotal: { type: ["number", "null"], description: "VAT抜き小計" },
-    vat: { type: ["number", "null"], description: "VAT額" },
-    total: { type: ["number", "null"], description: "支払合計額" },
-    currency: { type: "string", description: "通貨コード。通常THB" },
+    subtotal: { type: ["number", "null"], description: "税抜小計" },
+    vat: { type: ["number", "null"], description: "VAT額(日本は消費税額。10%と8%があれば合算)" },
+    total: { type: ["number", "null"], description: "支払合計額(税込)" },
+    currency: { type: "string", enum: ["THB", "JPY"], description: "通貨コード。タイはTHB、日本(円・¥)はJPY" },
     payment_method: { type: "string", description: "現金/カード/QR/その他。不明なら空文字" },
     category: { type: "string", enum: CATEGORIES },
     items_summary: { type: "string", description: "購入内容の短い日本語要約(30字程度)" },
     confidence: { type: "string", enum: ["high", "medium", "low"] },
   }, required: ["date", "store_name", "total", "currency", "category", "confidence"] },
 };
-const PROMPT = "これはタイで発行されたレシート/領収書の写真です。表記はタイ語と英語です。" +
+const PROMPT = "これはタイまたは日本で発行されたレシート/領収書の写真です。表記はタイ語・英語・日本語のいずれかです。" +
   "内容を読み取り、必ず record_receipt ツールを呼び出して返してください。\n" +
-  "- 日付は西暦YYYY-MM-DDに変換。タイ仏暦(例: 2569年/25/10/69)は543を引いて西暦にする。\n" +
-  "- 金額は数字のみ(カンマ・฿・บาท は除く)。\n" +
-  "- 合計は支払総額(รวมทั้งสิ้น / Total / Grand Total)。\n" +
+  "- 通貨: タイのレシートは THB、日本のレシート(円・¥)は JPY。\n" +
+  "- 日付は西暦YYYY-MM-DDに変換。タイ仏暦(例: 2569年/25/10/69)は543を引いて西暦にする。" +
+  "日本の和暦は令和N年=2018+N年、平成N年=1988+N年(例: R8.10.9 → 2026-10-09)。\n" +
+  "- 金額は数字のみ(カンマ・฿・บาท・¥・円 は除く)。\n" +
+  "- 合計は支払総額(รวมทั้งสิ้น / Total / Grand Total / 合計・税込合計)。お預り・お釣りではない。\n" +
+  "- 日本の登録番号(T+13桁)があれば tax_id に入れる。\n" +
   "- 読めない項目は推測せず null か空文字にし、confidence を下げる。";
 
 async function readReceipt(jpeg) {
@@ -106,6 +111,32 @@ async function readReceipt(jpeg) {
   if (!t) throw new Error("レシートを読み取れませんでした。もう一度撮影してください");
   return t.input;
 }
+
+/* ---------- 為替レート (社内レート: 月ごと。1バーツ = ○ 円 の形で持つ) ---------- */
+const rates = {
+  load() { try { return JSON.parse(ls.get("fx_rates", "{}")); } catch (e) { return {}; } },
+  save(o) { ls.set("fx_rates", JSON.stringify(o)); },
+};
+const isForeign = cur => !!cur && cur !== "THB";
+// 欧州中央銀行の参考レート(Frankfurter)。月初が休日なら直前の営業日のレートが返る
+async function fetchRate(cur, month) {
+  const r = await fetch(`https://api.frankfurter.dev/v1/${month}-01?base=THB&symbols=${cur}`);
+  const j = await r.json().catch(() => ({}));
+  const v = j.rates && j.rates[cur];
+  if (!r.ok || !(v > 0)) throw new Error("為替レートを自動取得できませんでした。レートを手入力してください");
+  return { rate: v, src: "自動", base: j.date };
+}
+async function monthRate(cur, month) {   // 保存済みの月次レートを使い、なければ取得して保存する
+  const k = `${cur}:${month}`, saved = rates.load()[k];
+  if (saved) return saved;
+  const e = await fetchRate(cur, month);
+  const all = rates.load(); all[k] = e; rates.save(all);
+  return e;
+}
+const round2 = v => Math.round(v * 100) / 100;
+// 台帳に入れるバーツ金額
+const thbOf = (d, v = d.total) =>
+  typeof v !== "number" ? null : !isForeign(d.currency) ? v : d.fx_rate > 0 ? round2(v / d.fx_rate) : null;
 
 /* ---------- Google 認証 (リダイレクト方式) ---------- */
 function redirectUri() { return location.origin + location.pathname; }
@@ -207,6 +238,20 @@ async function ensureMonthSheet(book, year, month) {
   return title;
 }
 
+// 使ったレートを台帳の「為替レート」シートに記録する(月・レートの組み合わせごとに1回だけ)
+async function logRate(book, d, title) {
+  const k = `ratelog_${book}_${d.currency}_${title}_${d.fx_rate}`;
+  if (ls.get(k)) return;
+  if (!(await sheetProps(book)).some(p => p.title === RATE_SHEET)) {
+    const res = await batch(book, [{ addSheet: { properties: { title: RATE_SHEET, gridProperties: { frozenRowCount: 1 } } } }]);
+    await putValues(book, `'${RATE_SHEET}'!A1`, [["月", "通貨", "レート(1THB=○原通貨)", "種別", "記録日時"]]);
+    await batch(book, [headFmt(res.replies[0].addSheet.properties.sheetId)]);
+  }
+  await g(`${SHEETS}/${book}/values/${encodeURIComponent(`'${RATE_SHEET}'!A1`)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+    jsonOpt("POST", { values: [[`'${title}`, d.currency, d.fx_rate, d.fx_src || "", new Date().toLocaleString("sv-SE")]] }));
+  ls.set(k, "1");
+}
+
 async function sendItem(item, retry = true) {
   const d = item.data, [year, month] = d.date.split("-").map(Number);
   const title = `${year}-${String(month).padStart(2, "0")}`;
@@ -225,15 +270,21 @@ async function sendItem(item, retry = true) {
     if (!book) { book = await findOrCreateBook(folderId, year); ls.set(bookKey, book); }
     const monthsKey = `months_${book}`, months = JSON.parse(ls.get(monthsKey, "[]"));
     if (!months.includes(title)) { await ensureMonthSheet(book, year, month); months.push(title); ls.set(monthsKey, JSON.stringify(months)); }
+    const hk = `hdr19_${book}_${title}`;   // 以前に作った月シートにも、為替の列の見出しを足す
+    if (!ls.get(hk)) { await putValues(book, `'${title}'!P1:S1`, [HEADER.slice(15)]); ls.set(hk, "1"); }
     return book;
   })();
   let book, link;
   try { [book, link] = await Promise.all([prepare, upload]); }
   catch (e) { await upload.catch(() => {}); throw e; }
-  const text = v => v ? `'${v}` : "", num = v => typeof v === "number" ? v : "";
-  const row = [d.date, d.store_name || "", d.store_name_original || "", text(d.tax_id), text(d.receipt_no), num(d.subtotal), num(d.vat),
-    num(d.total), d.currency || "THB", d.payment_method || "", d.category || "その他", d.items_summary || "", d.memo || "",
-    link, new Date().toLocaleString("sv-SE")];
+  const fx = isForeign(d.currency);
+  if (fx && !(d.fx_rate > 0)) throw new Error("為替レートが未設定のレシートがあります(" + (d.store_name || d.date) + ")");
+  const text = v => v ? `'${v}` : "", num = v => typeof v === "number" ? v : "", thb = v => typeof v === "number" ? thbOf(d, v) : "";
+  // F〜H は常にバーツ。原通貨の金額とレートは右端(P〜S)に残す
+  const row = [d.date, d.store_name || "", d.store_name_original || "", text(d.tax_id), text(d.receipt_no), thb(d.subtotal), thb(d.vat),
+    thb(d.total), "THB", d.payment_method || "", d.category || "その他", d.items_summary || "", d.memo || "",
+    link, new Date().toLocaleString("sv-SE"),
+    fx ? d.currency : "THB", num(d.total), fx ? d.fx_rate : 1, fx ? d.fx_src || "" : ""];
   if (resumed) {   // 画像リンクは1件ごとに固有。台帳に既にあれば、送信済みなので追記しない
     const col = (await g(`${SHEETS}/${book}/values/${encodeURIComponent(`'${title}'!N:N`)}`)).values || [];
     if (col.some(c => c[0] === link)) {
@@ -242,8 +293,13 @@ async function sendItem(item, retry = true) {
     }
   }
   try {
-    await g(`${SHEETS}/${book}/values/${encodeURIComponent(`'${title}'!A1`)}:append?valueInputOption=USER_ENTERED&insertDataOption=OVERWRITE`,
+    const res = await g(`${SHEETS}/${book}/values/${encodeURIComponent(`'${title}'!A1`)}:append?valueInputOption=USER_ENTERED&insertDataOption=OVERWRITE`,
       jsonOpt("POST", { values: [row] }));
+    if (fx) {   // 外貨の行は、合計を「原通貨の金額 ÷ レート」の計算式にする(レート列を直せば合計も変わる)
+      const n = /!A(\d+)/.exec(res.updates?.updatedRange || "");
+      if (n) await putValues(book, `'${title}'!H${n[1]}`, [[`=ROUND(Q${n[1]}/R${n[1]},2)`]]).catch(() => {});
+      await logRate(book, d, title).catch(() => {});
+    }
   } catch (e) {
     // 台帳やシートが手動で削除された等でキャッシュが古い場合は、消して1回だけやり直す
     if (retry && (e.status === 400 || e.status === 404)) { ls.del(bookKey); ls.del(`months_${book}`); return sendItem(item, false); }
@@ -294,7 +350,8 @@ async function render() {
     const l = document.createElement("div");
     l.textContent = `${it.data.date.slice(5)}  ${it.data.store_name || "(店名なし)"}`;
     const sub = document.createElement("small"); sub.style.display = "block";
-    sub.textContent = `${it.data.total ?? "-"} ${it.data.currency || ""} ・ ${it.data.category}`; l.append(sub);
+    const conv = isForeign(it.data.currency) && thbOf(it.data) != null ? `(≈ ${thbOf(it.data).toLocaleString()} THB)` : "";
+    sub.textContent = `${it.data.total ?? "-"} ${it.data.currency || ""}${conv} ・ ${it.data.category}`; l.append(sub);
     const tag = document.createElement("span"); tag.className = "tag " + it.status;
     tag.textContent = it.status === "done" ? "保存済み" : "未送信"; row.append(l, tag); return row;
   };
@@ -306,7 +363,7 @@ async function render() {
   if (keys.length && !openSet.size && !ls.get("open_months")) openSet.add(keys[0]);   // 初回は最新の月だけ開く
   for (const k of keys) {
     const list2 = months[k].sort((a, b) => b.data.date.localeCompare(a.data.date) || b.id - a.id);
-    const sum = list2.reduce((t, i) => t + (i.data.currency === "THB" || !i.data.currency ? Number(i.data.total) || 0 : 0), 0);
+    const sum = list2.reduce((t, i) => t + (thbOf(i.data) || 0), 0);
     const det = document.createElement("details"); det.open = openSet.has(k);
     const sm = document.createElement("summary");
     sm.innerHTML = `<b></b><span></span>`;
@@ -323,7 +380,31 @@ async function render() {
 }
 
 /* ---------- 撮影 → 確認 → 保存 ---------- */
-let current = null; // { blob }
+let current = null; // { blob, fxKey, fxSrc }
+
+// 外貨のレシートは、そのレシートの月の社内レートを入れ、換算後のバーツを見せる
+async function refreshFx() {
+  if (!current) return;
+  const cur = $("currency").value.trim().toUpperCase(), month = $("date").value.slice(0, 7);
+  $("fxBox").classList.toggle("hidden", !isForeign(cur));
+  $("fxLabel").textContent = `レート(1バーツ = ○ ${cur})`;
+  if (isForeign(cur) && /^\d{4}-\d{2}$/.test(month) && current.fxKey !== cur + month && current.fxSrc !== "個別手入力") {
+    current.fxKey = cur + month;
+    try {
+      const e = await monthRate(cur, month);
+      if (current && current.fxKey === cur + month) { $("fx_rate").value = e.rate; current.fxSrc = "月次(" + e.src + ")"; }
+    } catch (err) { $("fx_rate").value = ""; current.fxSrc = ""; msg(err.message, "err"); }
+  }
+  showThb();
+}
+function showThb() {
+  const rate = Number($("fx_rate").value), total = Number($("total").value.replace(/,/g, ""));
+  $("fxThb").textContent = rate > 0 && total ? `換算後 ${round2(total / rate).toLocaleString(undefined, { minimumFractionDigits: 2 })} THB`
+    + (current && current.fxSrc ? `(${current.fxSrc})` : "") : "レートを入力してください";
+}
+for (const id of ["date", "currency"]) $(id).addEventListener("change", refreshFx);
+$("total").addEventListener("input", showThb);
+$("fx_rate").addEventListener("input", () => { if (current) current.fxSrc = "個別手入力"; showThb(); });
 $("btnShoot").onclick = () => $("file").click();
 $("file").onchange = async e => {
   const f = e.target.files[0]; e.target.value = ""; if (!f) return;
@@ -333,12 +414,14 @@ $("file").onchange = async e => {
     const blob = await prepareImage(f);
     const data = await readReceipt(blob);
     const sec = ((performance.now() - t0) / 1000).toFixed(1);
-    current = { blob };
+    current = { blob, fxKey: "", fxSrc: "" };
     $("preview").src = URL.createObjectURL(blob);
     for (const k of FIELDS) { $(k).value = data[k] ?? ""; $(k).classList.remove("low"); }
     if (!$("currency").value) $("currency").value = "THB";
+    $("currency").value = $("currency").value.trim().toUpperCase();
     if (data.confidence !== "high") for (const k of ["date", "total", "store_name"]) $(k).classList.add("low");
     show("viewReview");
+    refreshFx();
     msg(data.confidence === "high" ? `読み取り完了(${sec}秒)。内容を確認して保存してください` :
       "読み取りに自信がない項目があります(赤枠)。画像と見比べて修正してください", data.confidence === "high" ? "ok" : "err");
   } catch (err) { msg(err.message, "err"); }
@@ -354,6 +437,11 @@ async function saveReview() {
   for (const k of FIELDS) { const v = $(k).value.trim(); data[k] = NUMS.includes(k) ? (v === "" ? null : Number(v.replace(/,/g, ""))) : v; }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(data.date)) { msg("日付を YYYY-MM-DD 形式で入力してください", "err"); return; }
   if (NUMS.some(k => Number.isNaN(data[k]))) { msg("金額は数字で入力してください", "err"); return; }
+  data.currency = (data.currency || "THB").toUpperCase();
+  if (isForeign(data.currency)) {
+    if (!(data.fx_rate > 0)) { msg("為替レート(1バーツ = ○ 円)を入力してください", "err"); return; }
+    data.fx_src = current.fxSrc || "個別手入力";
+  } else { data.fx_rate = null; }
   const dup = (await db.all()).find(i => i.data.date === data.date && i.data.total === data.total && data.total != null);
   if (dup && !confirm(`同じ日付・金額のレシートが既にあります(${dup.data.store_name})。\nもう一度保存しますか?`)) return;
   await db.put({ id: Date.now(), status: "pending", data, image: current.blob });
@@ -365,13 +453,41 @@ $("btnSync").onclick = sync;
 $("btnLogin").onclick = login;
 
 /* ---------- 設定 ---------- */
+const monthKey = (y, m) => { const d = new Date(y, m, 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; };
+// 月ごとの社内レート(円)。今月と前の2か月に、保存済みの月を加えて表示する
+async function renderRates() {
+  const now = new Date(), box = $("rateList");
+  const months = new Set([0, -1, -2].map(i => monthKey(now.getFullYear(), now.getMonth() + i)));
+  for (const k of Object.keys(rates.load())) if (k.startsWith("JPY:")) months.add(k.slice(4));
+  await Promise.all([...months].filter(m => !rates.load()["JPY:" + m]).map(m => monthRate("JPY", m).catch(() => {})));
+  box.textContent = "";
+  for (const m of [...months].sort().reverse().slice(0, 8)) {
+    const e = rates.load()["JPY:" + m], row = document.createElement("div"); row.className = "item";
+    const l = document.createElement("div"); l.textContent = `${m.slice(0, 4)}年${Number(m.slice(5))}月`;
+    const s = document.createElement("small"); s.style.display = "block";
+    s.textContent = e ? (e.src === "自動" ? `自動(欧州中央銀行 ${e.base})` : "手入力") : "未取得"; l.append(s);
+    const inp = document.createElement("input"); inp.dataset.m = m; inp.inputMode = "decimal"; inp.style.width = "110px";
+    inp.value = e ? e.rate : ""; inp.placeholder = "円"; row.append(l, inp); box.append(row);
+  }
+}
+function saveRates() {
+  const all = rates.load();
+  for (const inp of $("rateList").querySelectorAll("input")) {
+    const k = "JPY:" + inp.dataset.m, v = Number(inp.value.replace(/,/g, "")), prev = all[k];
+    if (inp.value.trim() === "") { if (prev && prev.src === "手入力") delete all[k]; }   // 空欄 → 自動に戻す
+    else if (v > 0 && (!prev || prev.rate !== v)) all[k] = { rate: v, src: "手入力", base: "" };
+  }
+  rates.save(all);
+}
 $("btnSettings").onclick = () => {
+  renderRates();
   $("setKey").value = ls.get("anthropic_key"); $("setClient").value = ls.get("client_id", DEFAULT_CLIENT_ID);
   $("setEmail").value = ls.get("email", "tomonori19720629@gmail.com"); $("setFolder").value = ls.get("folder_name", "タイレシート経費精算");
   $("redirectUri").textContent = redirectUri(); show("viewSettings"); msg("");
 };
 $("btnSettingsBack").onclick = () => show("viewMain");
 $("btnSettingsSave").onclick = () => {
+  saveRates();
   ls.set("anthropic_key", $("setKey").value.trim()); ls.set("client_id", $("setClient").value.trim() || DEFAULT_CLIENT_ID);
   ls.set("email", $("setEmail").value.trim()); ls.set("folder_name", $("setFolder").value.trim() || "タイレシート経費精算");
   show("viewMain"); msg("設定を保存しました", "ok"); render();
@@ -382,6 +498,7 @@ $("btnSettingsSave").onclick = () => {
   $("category").innerHTML = CATEGORIES.map(c => `<option>${c}</option>`).join("");
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
   const back = takeTokenFromHash();
+  monthRate("JPY", monthKey(new Date().getFullYear(), new Date().getMonth())).catch(() => {});   // 新しい月の最初に開いたとき、今月の社内レートを自動で入れる
   await render();
   if (!ls.get("anthropic_key")) { msg("はじめに右上の ⚙︎ で Anthropic の API キーを入力してください", "info"); }
   if (back) { msg("Googleにログインしました", "ok"); await sync(); }

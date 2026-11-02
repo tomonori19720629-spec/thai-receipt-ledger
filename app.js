@@ -322,8 +322,19 @@ async function sync() {
   } finally { syncing = false; setBusy(false); await render(); }
 }
 function setBusy(b) { $("btnSync").disabled = b; $("btnLogin").disabled = b; $("btnConfirmSend").disabled = b; }
+// 削除待ち(オフラインやログイン前に削除したレシート)の行を、台帳から消す
+async function processDeletes() {
+  if (!token()) return 0;
+  let n = 0;
+  for (const it of (await db.all()).filter(i => i.status === "delete")) {
+    try { await deleteSheetRows(it); await db.del(it.id); n++; }
+    catch (e) { if (e instanceof AuthError) break; }   // 失敗したものは削除待ちのまま残し、次回やり直す
+  }
+  return n;
+}
 async function doSync() {
   try {
+    await processDeletes();
     const pend = (await db.all()).filter(i => i.status === "pending").sort((a, b) => a.id - b.id);
     const t0 = performance.now();
     for (const p of pend) {
@@ -338,10 +349,14 @@ async function doSync() {
 }
 
 async function render() {
-  const items = (await db.all()).sort((a, b) => b.id - a.id);
-  const pend = items.filter(i => i.status === "pending").length;
-  $("syncCard").classList.toggle("hidden", pend === 0);
-  $("syncText").textContent = `未送信が ${pend} 件あります` + (token() ? "" : "(Googleへのログインが必要です)");
+  const all = (await db.all()).sort((a, b) => b.id - a.id);
+  const items = all.filter(i => i.status !== "delete");   // 削除待ちは履歴に出さない
+  const pend = items.filter(i => i.status === "pending").length, dels = all.length - items.length;
+  $("syncCard").classList.toggle("hidden", pend === 0 && dels === 0);
+  $("btnSync").classList.toggle("hidden", pend === 0);
+  $("syncText").textContent = [pend ? `未送信が ${pend} 件あります` : "",
+    dels ? `台帳から削除待ちが ${dels} 件あります(Googleに接続すると自動で削除します)` : ""].filter(Boolean).join("\n")
+    + (token() ? "" : "\n(Googleへのログインが必要です)");
   $("btnLogin").classList.toggle("hidden", !!token());
   const list = $("list"); list.textContent = "";
   if (!items.length) list.innerHTML = "<small>まだありません</small>";
@@ -524,17 +539,19 @@ $("btnDelete").onclick = async () => {
                     : "このレシートを削除しますか?")) return;
   $("btnDelete").disabled = true;
   try {
-    let n = 0;
-    if (done) {
-      if (!token()) { msg("台帳の行も削除するため、先に Google にログインしてください", "err"); return; }
-      msg("台帳から削除中…", "info");
-      try { n = await deleteSheetRows(it); }
-      catch (e) { msg(e instanceof AuthError ? e.message : "台帳の行を削除できませんでした: " + e.message, "err"); return; }
+    let n = 0, later = false;
+    if (done) {   // ログイン中ならすぐ台帳から消す。できなければ「削除待ち」にして、次に Google に接続したとき自動で消す
+      if (token()) {
+        msg("台帳から削除中…", "info");
+        try { n = await deleteSheetRows(it); } catch (e) { later = true; }
+      } else later = true;
     }
     const back = current.returnTo;
-    await db.del(it.id); current = null;
+    if (later) { it.status = "delete"; await db.put(it); } else await db.del(it.id);
+    current = null;
     if (back) await openConfirm(); else { show("viewMain"); await render(); }
-    msg(done ? (n ? `削除しました(台帳の ${n} 行も削除)` : "削除しました(台帳に該当の行はありませんでした)") : "削除しました", "ok");
+    msg(later ? "削除しました。台帳の行は、次に Google に接続したとき自動で削除します"
+      : done ? (n ? `削除しました(台帳の ${n} 行も削除)` : "削除しました(台帳に該当の行はありませんでした)") : "削除しました", "ok");
   } finally { $("btnDelete").disabled = false; }
 };
 $("btnCancel").onclick = () => {
@@ -557,7 +574,7 @@ async function saveReview() {
     data.fx_src = current.fxSrc || "個別手入力";
   } else { data.fx_rate = null; }
   if (current.editId) return updateItem(data);
-  const dup = (await db.all()).find(i => i.data.date === data.date && i.data.total === data.total && data.total != null);
+  const dup = (await db.all()).find(i => i.status !== "delete" && i.data.date === data.date && i.data.total === data.total && data.total != null);
   if (dup && !confirm(`同じ日付・金額のレシートが既にあります(${dup.data.store_name})。\nもう一度保存しますか?`)) return;
   await db.put({ id: Date.now(), status: "pending", data, image: current.blob });
   current = null; show("viewMain"); msg("");
@@ -614,6 +631,7 @@ $("btnSettingsSave").onclick = () => {
   $("category").innerHTML = CATEGORIES.map(c => `<option>${c}</option>`).join("");
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
   const back = takeTokenFromHash();
+  processDeletes().then(n => { if (n) { msg(`削除待ちだった ${n} 件を台帳から削除しました`, "ok"); render(); } });
   monthRate("JPY", monthKey(new Date().getFullYear(), new Date().getMonth())).catch(() => {});   // 新しい月の最初に開いたとき、今月の社内レートを自動で入れる
   await render();
   if (!ls.get("anthropic_key")) { msg("はじめに右上の ⚙︎ で Anthropic の API キーを入力してください", "info"); }

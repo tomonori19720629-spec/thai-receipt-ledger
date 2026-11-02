@@ -330,6 +330,7 @@ async function processDeletes() {
     try { await deleteSheetRows(it); await db.del(it.id); n++; }
     catch (e) { if (e instanceof AuthError) break; }   // 失敗したものは削除待ちのまま残し、次回やり直す
   }
+  for (const it of (await db.all()).filter(i => i.status === "update")) if (await applyUpdate(it)) n++;
   return n;
 }
 async function doSync() {
@@ -352,9 +353,11 @@ async function render() {
   const all = (await db.all()).sort((a, b) => b.id - a.id);
   const items = all.filter(i => i.status !== "delete");   // 削除待ちは履歴に出さない
   const pend = items.filter(i => i.status === "pending").length, dels = all.length - items.length;
-  $("syncCard").classList.toggle("hidden", pend === 0 && dels === 0);
+  const upds = items.filter(i => i.status === "update").length;
+  $("syncCard").classList.toggle("hidden", pend === 0 && dels === 0 && upds === 0);
   $("btnSync").classList.toggle("hidden", pend === 0);
   $("syncText").textContent = [pend ? `未送信が ${pend} 件あります` : "",
+    upds ? `台帳の修正待ちが ${upds} 件あります(Googleに接続すると自動で反映します)` : "",
     dels ? `台帳から削除待ちが ${dels} 件あります(Googleに接続すると自動で削除します)` : ""].filter(Boolean).join("\n")
     + (token() ? "" : "\n(Googleへのログインが必要です)");
   $("btnLogin").classList.toggle("hidden", !!token());
@@ -369,7 +372,7 @@ async function render() {
     const conv = isForeign(it.data.currency) && thbOf(it.data) != null ? `(≈ ${thbOf(it.data).toLocaleString()} THB)` : "";
     sub.textContent = `${it.data.total ?? "-"} ${it.data.currency || ""}${conv} ・ ${it.data.category}`; l.append(sub);
     const tag = document.createElement("span"); tag.className = "tag " + it.status;
-    tag.textContent = it.status === "done" ? "保存済み" : "未送信"; row.append(l, tag); return row;
+    tag.textContent = it.status === "done" ? "保存済み" : it.status === "update" ? "修正待ち" : "未送信"; row.append(l, tag); return row;
   };
   // 月ごとにまとめる(新しい月が上)。月の見出しをタップすると、その月の履歴が開く
   const months = {};
@@ -456,7 +459,7 @@ async function openEdit(id, returnTo = "") {
   for (const k of FIELDS) { $(k).value = it.data[k] ?? ""; $(k).classList.remove("low"); }
   current.fxKey = $("currency").value.trim().toUpperCase() + $("date").value.slice(0, 7);   // 開いただけで保存済みのレートを上書きしない
   setEditMode(true); show("viewReview"); refreshFx();
-  msg(it.status === "done" ? "保存済みのレシートです。更新・削除すると台帳の行にも反映されます(Googleへのログインが必要です)"
+  msg(it.status === "done" ? "保存済みのレシートです。更新・削除は台帳の行にも反映されます(ログインしていなければ、次に Google に接続したとき自動で反映します)"
                            : "未送信のレシートです。この iPhone 内だけを更新します", "info");
 }
 // 台帳の中で、このレシートの行(画像リンクが同じ行)を探して削除する。削除した行数を返す
@@ -476,23 +479,23 @@ async function deleteSheetRows(item) {
 }
 async function updateItem(data) {
   const it = await db.get(current.editId); if (!it) return;
-  const back = current.returnTo, wasDone = it.status === "done";
-  if (wasDone) {
-    if (!token()) { msg("台帳の行も直すため、先に Google にログインしてください", "err"); return; }
-    msg("台帳を更新中…", "info");
-    try { await deleteSheetRows(it); }   // 古い行を消し、直した内容を未送信にして送り直す(月が変わっても対応できる)
-    catch (e) { msg(e instanceof AuthError ? e.message : "台帳を更新できませんでした: " + e.message, "err"); return; }
-    it.status = "pending";
+  const back = current.returnTo, inLedger = it.status === "done" || it.status === "update";
+  it.data = data;
+  if (!inLedger) {   // 未送信のレシートは、この iPhone 内だけを直す
+    await db.put(it); current = null; msg("");
+    if (back) await openConfirm(); else { show("viewMain"); await render(); msg("修正しました", "ok"); }
+    return;
   }
-  it.data = data; await db.put(it);
-  current = null; msg("");
-  if (wasDone) {   // 台帳から消した分は、この1件だけすぐ送り直す(他の未送信分は送らない)
-    show("viewMain"); await render();
-    try { await sendItem(it); msg("台帳を更新しました", "ok"); }
-    catch (e) { msg(e instanceof AuthError ? e.message : "台帳へ送信できませんでした。「確認して送信」からやり直してください: " + e.message, "err"); }
-    await render(); return;
-  }
-  if (back) await openConfirm(); else { show("viewMain"); await render(); msg("修正しました", "ok"); }
+  // 台帳に入っているレシート: まず「修正待ち」として確定し、台帳へはログイン中ならすぐ、そうでなければ次に Google に接続したとき自動で反映する
+  it.status = "update"; await db.put(it);
+  current = null; msg(""); show("viewMain"); await render();
+  if (token() && await applyUpdate(it)) msg("修正して、台帳にも反映しました", "ok");
+  else msg("修正しました。台帳へは、次に Google に接続したとき自動で反映します", "info");
+  await render();
+}
+// 台帳の古い行を消して、直した内容を送り直す(月が変わっても対応できる)。成功したら true
+async function applyUpdate(it) {
+  try { await deleteSheetRows(it); await sendItem(it); return true; } catch (e) { return false; }
 }
 
 // 送信前の確認画面: 未送信のレシートを一覧にして、間違いがないか見てから送る
@@ -534,7 +537,7 @@ $("btnConfirmSend").onclick = async () => {
 $("btnDelete").onclick = async () => {
   if (!current || !current.editId || $("btnDelete").disabled) return;
   const it = await db.get(current.editId); if (!it) return;
-  const done = it.status === "done";
+  const done = it.status === "done" || it.status === "update";
   if (!confirm(done ? "このレシートを削除しますか?\n台帳(スプレッドシート)の行も削除されます。ドライブの画像は残ります。"
                     : "このレシートを削除しますか?")) return;
   $("btnDelete").disabled = true;
@@ -631,7 +634,7 @@ $("btnSettingsSave").onclick = () => {
   $("category").innerHTML = CATEGORIES.map(c => `<option>${c}</option>`).join("");
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
   const back = takeTokenFromHash();
-  processDeletes().then(n => { if (n) { msg(`削除待ちだった ${n} 件を台帳から削除しました`, "ok"); render(); } });
+  processDeletes().then(n => { if (n) { msg(`削除・修正の待ちだった ${n} 件を台帳に反映しました`, "ok"); render(); } });
   monthRate("JPY", monthKey(new Date().getFullYear(), new Date().getMonth())).catch(() => {});   // 新しい月の最初に開いたとき、今月の社内レートを自動で入れる
   await render();
   if (!ls.get("anthropic_key")) { msg("はじめに右上の ⚙︎ で Anthropic の API キーを入力してください", "info"); }

@@ -72,14 +72,25 @@
 
     <div class="card hidden" id="syncCard">
       <div id="syncText"></div>
-      <div class="row"><button id="btnSync">今すぐ送信</button><button class="sub" id="btnLogin">Googleにログイン</button></div>
+      <div class="row"><button id="btnSync">確認して送信</button><button class="sub" id="btnLogin">Googleにログイン</button></div>
     </div>
 
     <div class="card">
       <h2>履歴(この iPhone 内)</h2>
+      <p class="sub-text" style="margin:0 0 4px">行をタップすると、修正・削除できます</p>
       <div id="list"><small>まだありません</small></div>
     </div>
     <p style="text-align:center"><a id="sheetLink" href="#" target="_blank" class="hidden">📊 台帳スプレッドシートを開く</a></p>
+  </section>
+
+  <section id="viewConfirm" class="hidden">
+    <div class="card">
+      <h2>送信前の確認</h2>
+      <p class="sub-text" style="margin:0 0 4px">内容を見て、間違いがあれば行をタップして修正・削除してください。</p>
+      <div id="confirmList"></div>
+      <p id="confirmSum" style="font-weight:600;margin:10px 0 0"></p>
+      <div class="row"><button id="btnConfirmSend">送信</button><button class="sub" id="btnConfirmBack">戻る</button></div>
+    </div>
   </section>
 
   <section id="viewReview" class="hidden">
@@ -105,6 +116,7 @@
       </div>
       <label>メモ</label><input id="memo">
       <div class="row"><button id="btnSave">✅ 保存</button><button class="sub" id="btnCancel">破棄</button></div>
+      <div class="row"><button id="btnDelete" class="sub hidden" style="color:var(--err)">🗑 このレシートを削除</button></div>
     </div>
   </section>
 

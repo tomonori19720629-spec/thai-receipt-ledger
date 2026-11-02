@@ -28,7 +28,7 @@ function msg(text, kind) {
   const m = $("msg"); m.textContent = text || ""; m.className = text ? kind : "";
 }
 function show(view) {
-  for (const v of ["viewMain", "viewReview", "viewSettings"]) $(v).classList.toggle("hidden", v !== view);
+  for (const v of ["viewMain", "viewReview", "viewSettings", "viewConfirm"]) $(v).classList.toggle("hidden", v !== view);
   window.scrollTo(0, 0);
 }
 
@@ -51,6 +51,7 @@ const db = {
   put(item) { return this.tx("readwrite", s => s.put(item)); },
   all() { return this.tx("readonly", s => s.getAll()); },
   get(id) { return this.tx("readonly", s => s.get(id)); },
+  del(id) { return this.tx("readwrite", s => s.delete(id)); },
 };
 
 /* ---------- 画像 ---------- */
@@ -320,7 +321,7 @@ async function sync() {
     else await doSync();
   } finally { syncing = false; setBusy(false); await render(); }
 }
-function setBusy(b) { $("btnSync").disabled = b; $("btnLogin").disabled = b; }
+function setBusy(b) { $("btnSync").disabled = b; $("btnLogin").disabled = b; $("btnConfirmSend").disabled = b; }
 async function doSync() {
   try {
     const pend = (await db.all()).filter(i => i.status === "pending").sort((a, b) => a.id - b.id);
@@ -342,11 +343,11 @@ async function render() {
   $("syncCard").classList.toggle("hidden", pend === 0);
   $("syncText").textContent = `未送信が ${pend} 件あります` + (token() ? "" : "(Googleへのログインが必要です)");
   $("btnLogin").classList.toggle("hidden", !!token());
-  $("btnSync").classList.toggle("hidden", !token());
   const list = $("list"); list.textContent = "";
   if (!items.length) list.innerHTML = "<small>まだありません</small>";
   const itemRow = it => {
-    const row = document.createElement("div"); row.className = "item";
+    const row = document.createElement("div"); row.className = "item"; row.style.cursor = "pointer";
+    row.onclick = () => openEdit(it.id);
     const l = document.createElement("div");
     l.textContent = `${it.data.date.slice(5)}  ${it.data.store_name || "(店名なし)"}`;
     const sub = document.createElement("small"); sub.style.display = "block";
@@ -414,7 +415,7 @@ $("file").onchange = async e => {
     const blob = await prepareImage(f);
     const data = await readReceipt(blob);
     const sec = ((performance.now() - t0) / 1000).toFixed(1);
-    current = { blob, fxKey: "", fxSrc: "" };
+    current = { blob, fxKey: "", fxSrc: "" }; setEditMode(false);
     $("preview").src = URL.createObjectURL(blob);
     for (const k of FIELDS) { $(k).value = data[k] ?? ""; $(k).classList.remove("low"); }
     if (!$("currency").value) $("currency").value = "THB";
@@ -426,7 +427,120 @@ $("file").onchange = async e => {
       "読み取りに自信がない項目があります(赤枠)。画像と見比べて修正してください", data.confidence === "high" ? "ok" : "err");
   } catch (err) { msg(err.message, "err"); }
 };
-$("btnCancel").onclick = () => { current = null; show("viewMain"); msg(""); };
+function setEditMode(on) {
+  $("btnDelete").classList.toggle("hidden", !on);
+  $("btnCancel").textContent = on ? "戻る" : "破棄";
+  $("btnSave").textContent = on ? "✅ 更新" : "✅ 保存";
+}
+// 履歴のレシートを開いて、修正・削除する(保存済みなら台帳の行にも反映)
+async function openEdit(id, returnTo = "") {
+  if (syncing) { msg("送信中です。終わってからお試しください", "info"); return; }
+  const it = await db.get(id); if (!it) return;
+  current = { blob: it.image, editId: id, returnTo, fxKey: "", fxSrc: it.data.fx_src || "" };
+  $("preview").src = URL.createObjectURL(it.image);
+  for (const k of FIELDS) { $(k).value = it.data[k] ?? ""; $(k).classList.remove("low"); }
+  current.fxKey = $("currency").value.trim().toUpperCase() + $("date").value.slice(0, 7);   // 開いただけで保存済みのレートを上書きしない
+  setEditMode(true); show("viewReview"); refreshFx();
+  msg(it.status === "done" ? "保存済みのレシートです。更新・削除すると台帳の行にも反映されます(Googleへのログインが必要です)"
+                           : "未送信のレシートです。この iPhone 内だけを更新します", "info");
+}
+// 台帳の中で、このレシートの行(画像リンクが同じ行)を探して削除する。削除した行数を返す
+async function deleteSheetRows(item) {
+  if (!item.imageLink) throw new Error("このレシートには画像リンクがなく、台帳の行を特定できません");
+  const folderId = await getFolderId(), title = item.sheet || item.data.date.slice(0, 7);
+  const book = item.bookUrl ? item.bookUrl.split("/d/")[1]
+    : (ls.get(`book_${folderId}_${title.slice(0, 4)}`) || await findOrCreateBook(folderId, title.slice(0, 4)));
+  const sheet = (await sheetProps(book)).find(p => p.title === title);
+  if (!sheet) return 0;
+  const col = (await g(`${SHEETS}/${book}/values/${encodeURIComponent(`'${title}'!N:N`)}`)).values || [];
+  const idx = col.map((c, i) => c[0] === item.imageLink ? i : -1).filter(i => i > 0);   // 0行目は見出し
+  if (!idx.length) return 0;
+  await batch(book, idx.sort((a, b) => b - a).map(i =>   // 下の行から消してずれを防ぐ
+    ({ deleteDimension: { range: { sheetId: sheet.sheetId, dimension: "ROWS", startIndex: i, endIndex: i + 1 } } })));
+  return idx.length;
+}
+async function updateItem(data) {
+  const it = await db.get(current.editId); if (!it) return;
+  const back = current.returnTo, wasDone = it.status === "done";
+  if (wasDone) {
+    if (!token()) { msg("台帳の行も直すため、先に Google にログインしてください", "err"); return; }
+    msg("台帳を更新中…", "info");
+    try { await deleteSheetRows(it); }   // 古い行を消し、直した内容を未送信にして送り直す(月が変わっても対応できる)
+    catch (e) { msg(e instanceof AuthError ? e.message : "台帳を更新できませんでした: " + e.message, "err"); return; }
+    it.status = "pending";
+  }
+  it.data = data; await db.put(it);
+  current = null; msg("");
+  if (wasDone) {   // 台帳から消した分は、この1件だけすぐ送り直す(他の未送信分は送らない)
+    show("viewMain"); await render();
+    try { await sendItem(it); msg("台帳を更新しました", "ok"); }
+    catch (e) { msg(e instanceof AuthError ? e.message : "台帳へ送信できませんでした。「確認して送信」からやり直してください: " + e.message, "err"); }
+    await render(); return;
+  }
+  if (back) await openConfirm(); else { show("viewMain"); await render(); msg("修正しました", "ok"); }
+}
+
+// 送信前の確認画面: 未送信のレシートを一覧にして、間違いがないか見てから送る
+function warnOf(d, all) {
+  const w = [];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d.date || "")) w.push("日付");
+  if (!(d.total > 0)) w.push("金額");
+  if (isForeign(d.currency) && !(d.fx_rate > 0)) w.push("レート");
+  if (all.filter(o => o.data.date === d.date && o.data.total === d.total).length > 1) w.push("重複?");
+  return w;
+}
+async function openConfirm() {
+  const pend = (await db.all()).filter(i => i.status === "pending")
+    .sort((a, b) => (a.data.date || "").localeCompare(b.data.date || "") || a.id - b.id);
+  if (!pend.length) { show("viewMain"); await render(); return; }
+  const box = $("confirmList"); box.textContent = "";
+  let sum = 0, bad = 0;
+  for (const it of pend) {
+    const d = it.data, w = warnOf(d, pend), thb = thbOf(d); sum += thb || 0; if (w.length) bad++;
+    const row = document.createElement("div"); row.className = "item"; row.style.cursor = "pointer";
+    row.onclick = () => openEdit(it.id, "confirm");
+    const l = document.createElement("div"); l.textContent = `${(d.date || "").slice(5)}  ${d.store_name || "(店名なし)"}`;
+    const sub = document.createElement("small"); sub.style.display = "block";
+    sub.textContent = `${d.total ?? "-"} ${d.currency || ""}` + (isForeign(d.currency) && thb != null ? `(≈ ${thb.toLocaleString()} THB)` : "") + ` ・ ${d.category}`;
+    l.append(sub);
+    const tag = document.createElement("span"); tag.className = "tag " + (w.length ? "pending" : "done");
+    tag.textContent = w.length ? "要確認: " + w.join("・") : "OK"; row.append(l, tag); box.append(row);
+  }
+  $("confirmSum").textContent = `${pend.length}件 ・ 合計 ${sum.toLocaleString(undefined, { maximumFractionDigits: 2 })} THB` + (bad ? ` ・ 要確認 ${bad}件` : "");
+  $("btnConfirmSend").textContent = token() ? `この内容で ${pend.length} 件を送信` : "Googleにログインして送信";
+  show("viewConfirm");
+}
+$("btnConfirmBack").onclick = () => { show("viewMain"); msg(""); render(); };
+$("btnConfirmSend").onclick = async () => {
+  if (!token()) { login(); return; }
+  await sync();   // sync の最後に画面を更新する
+  if ((await db.all()).some(i => i.status === "pending")) await openConfirm(); else show("viewMain");
+};
+$("btnDelete").onclick = async () => {
+  if (!current || !current.editId || $("btnDelete").disabled) return;
+  const it = await db.get(current.editId); if (!it) return;
+  const done = it.status === "done";
+  if (!confirm(done ? "このレシートを削除しますか?\n台帳(スプレッドシート)の行も削除されます。ドライブの画像は残ります。"
+                    : "このレシートを削除しますか?")) return;
+  $("btnDelete").disabled = true;
+  try {
+    let n = 0;
+    if (done) {
+      if (!token()) { msg("台帳の行も削除するため、先に Google にログインしてください", "err"); return; }
+      msg("台帳から削除中…", "info");
+      try { n = await deleteSheetRows(it); }
+      catch (e) { msg(e instanceof AuthError ? e.message : "台帳の行を削除できませんでした: " + e.message, "err"); return; }
+    }
+    const back = current.returnTo;
+    await db.del(it.id); current = null;
+    if (back) await openConfirm(); else { show("viewMain"); await render(); }
+    msg(done ? (n ? `削除しました(台帳の ${n} 行も削除)` : "削除しました(台帳に該当の行はありませんでした)") : "削除しました", "ok");
+  } finally { $("btnDelete").disabled = false; }
+};
+$("btnCancel").onclick = () => {
+  const back = current && current.returnTo; current = null; msg("");
+  if (back) openConfirm(); else show("viewMain");
+};
 $("btnSave").onclick = async () => {
   if ($("btnSave").disabled) return;
   $("btnSave").disabled = true;
@@ -442,14 +556,16 @@ async function saveReview() {
     if (!(data.fx_rate > 0)) { msg("為替レート(1バーツ = ○ 円)を入力してください", "err"); return; }
     data.fx_src = current.fxSrc || "個別手入力";
   } else { data.fx_rate = null; }
+  if (current.editId) return updateItem(data);
   const dup = (await db.all()).find(i => i.data.date === data.date && i.data.total === data.total && data.total != null);
   if (dup && !confirm(`同じ日付・金額のレシートが既にあります(${dup.data.store_name})。\nもう一度保存しますか?`)) return;
   await db.put({ id: Date.now(), status: "pending", data, image: current.blob });
   current = null; show("viewMain"); msg("");
   await render();
-  if (token()) await sync(); else msg("端末に保存しました。Googleにログインすると台帳へ送信されます", "info");
+  const n = (await db.all()).filter(i => i.status === "pending").length;   // 送信はまとめて、最後に確認してから行う
+  msg(`保存しました(未送信 ${n} 件)。続けて撮影するか、「確認して送信」を押してください`, "ok");
 }
-$("btnSync").onclick = sync;
+$("btnSync").onclick = openConfirm;
 $("btnLogin").onclick = login;
 
 /* ---------- 設定 ---------- */
@@ -501,5 +617,5 @@ $("btnSettingsSave").onclick = () => {
   monthRate("JPY", monthKey(new Date().getFullYear(), new Date().getMonth())).catch(() => {});   // 新しい月の最初に開いたとき、今月の社内レートを自動で入れる
   await render();
   if (!ls.get("anthropic_key")) { msg("はじめに右上の ⚙︎ で Anthropic の API キーを入力してください", "info"); }
-  if (back) { msg("Googleにログインしました", "ok"); await sync(); }
+  if (back) { await openConfirm(); msg("Googleにログインしました。内容を確認して送信してください", "ok"); }
 })();

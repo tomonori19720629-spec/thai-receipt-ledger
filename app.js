@@ -23,6 +23,7 @@ const ls = {
   del: k => { try { localStorage.removeItem(k); } catch (e) {} },
 };
 class AuthError extends Error {}
+const NEED_SCOPES_MSG = "Googleの権限が足りません。「Googleにログイン」でもう一度ログインし、許可の画面で『ドライブ』と『スプレッドシート』の項目すべてにチェックを入れてください";
 
 function msg(text, kind) {
   const m = $("msg"); m.textContent = text || ""; m.className = text ? kind : "";
@@ -149,15 +150,22 @@ function login() {
   const cid = ls.get("client_id", DEFAULT_CLIENT_ID);
   if (!cid) { msg("設定(⚙︎)で Google クライアント ID を入力してください", "err"); return; }
   const p = new URLSearchParams({ client_id: cid, redirect_uri: redirectUri(), response_type: "token", scope: SCOPES,
-    include_granted_scopes: "true", login_hint: ls.get("email"), prompt: "select_account" });
+    include_granted_scopes: "true", login_hint: ls.get("email"),
+    prompt: ls.get("need_consent") ? "consent select_account" : "select_account" });   // 権限が足りなかった後は、許可の画面をもう一度出す
   location.href = "https://accounts.google.com/o/oauth2/v2/auth?" + p;
 }
 function takeTokenFromHash() {
   if (!location.hash.includes("access_token")) return false;
   const p = new URLSearchParams(location.hash.slice(1));
+  history.replaceState(null, "", location.pathname);
+  // Googleの許可画面で項目のチェックが外されていると、権限の足りないトークンが返る
+  const granted = (p.get("scope") || "").split(" ");
+  if (!SCOPES.split(" ").every(x => granted.includes(x))) {
+    ls.del("g_token"); ls.set("need_consent", "1"); return "scope";
+  }
+  ls.del("need_consent");
   ls.set("g_token", p.get("access_token"));
   ls.set("g_exp", String(Date.now() + Number(p.get("expires_in") || 3600) * 1000));
-  history.replaceState(null, "", location.pathname);
   return true;
 }
 
@@ -166,6 +174,10 @@ async function g(url, opt = {}) {
   const r = await fetch(url, { ...opt, headers: { Authorization: "Bearer " + t, ...(opt.headers || {}) } });
   if (r.status === 401) { ls.del("g_token"); throw new AuthError("ログインの有効期限が切れました"); }
   const j = await r.json().catch(() => ({}));
+  if (r.status === 403 && /insufficient authentication scopes/i.test(j.error?.message || "")) {
+    ls.del("g_token"); ls.set("need_consent", "1");
+    throw new AuthError(NEED_SCOPES_MSG);
+  }
   if (!r.ok) { const e = new Error(j.error?.message || "Google API エラー " + r.status); e.status = r.status; throw e; }
   return j;
 }
@@ -638,5 +650,6 @@ $("btnSettingsSave").onclick = () => {
   monthRate("JPY", monthKey(new Date().getFullYear(), new Date().getMonth())).catch(() => {});   // 新しい月の最初に開いたとき、今月の社内レートを自動で入れる
   await render();
   if (!ls.get("anthropic_key")) { msg("はじめに右上の ⚙︎ で Anthropic の API キーを入力してください", "info"); }
-  if (back) { await openConfirm(); msg("Googleにログインしました。内容を確認して送信してください", "ok"); }
+  if (back === "scope") { msg(NEED_SCOPES_MSG, "err"); }
+  else if (back) { await openConfirm(); msg("Googleにログインしました。内容を確認して送信してください", "ok"); }
 })();

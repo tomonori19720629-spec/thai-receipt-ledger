@@ -337,6 +337,7 @@ async function sync() {
     if (navigator.locks) await navigator.locks.request("receipt-sync", { ifAvailable: true }, lock => lock ? doSync() : msg("別の画面で送信中です", "info"));
     else await doSync();
   } finally { syncing = false; setBusy(false); await render(); }
+  pullLedger();   // 送信のあと、台帳と履歴を合わせる
 }
 function setBusy(b) { $("btnSync").disabled = b; $("btnLogin").disabled = b; $("btnConfirmSend").disabled = b; }
 // 削除待ち(オフラインやログイン前に削除したレシート)の行を、台帳から消す
@@ -350,6 +351,68 @@ async function processDeletes() {
   for (const it of (await db.all()).filter(i => i.status === "update")) if (await applyUpdate(it)) n++;
   return n;
 }
+/* ---------- 台帳 → 履歴 (どの入口・端末でも、履歴を台帳と同じにする) ---------- */
+let pulling = false;
+const cellNum = v => { if (v === "" || v == null) return null; const n = Number(String(v).replace(/,/g, "")); return Number.isFinite(n) ? n : null; };
+function rowToItem(r, title, bookId) {
+  const c = i => (r[i] ?? "").toString();
+  const m = /(\d{4})\D+(\d{1,2})\D+(\d{1,2})/.exec(c(0));
+  const cur = c(15) || c(8) || "THB", fx = isForeign(cur), rate = cellNum(r[17]);
+  const orig = v => { const n = cellNum(v); return n == null ? null : fx && rate > 0 ? round2(n * rate) : n; };   // 小計・VATは台帳ではバーツ。原通貨に戻す
+  return {
+    date: m ? `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}` : title + "-01",
+    store_name: c(1), store_name_original: c(2), tax_id: c(3), receipt_no: c(4),
+    subtotal: orig(r[5]), vat: orig(r[6]), total: cellNum(r[16]) ?? cellNum(r[7]), currency: cur,
+    payment_method: c(9), category: CATEGORIES.includes(c(10)) ? c(10) : "その他", items_summary: c(11), memo: c(12),
+    fx_rate: fx && rate > 0 ? rate : null, fx_src: fx ? c(18) : "",
+  };
+}
+// 台帳の月別シートを読み、この端末の履歴に足りない分を足し、台帳から消えた分を履歴からも消す
+async function pullLedger(manual) {
+  if (pulling || syncing) return 0;
+  if (!token()) { if (manual) login(); return 0; }
+  pulling = true;
+  try {
+    if (manual) msg("台帳から履歴を読み込み中…", "info");
+    const folderId = await getFolderId();
+    const q = `'${folderId}' in parents and name contains '経費精算台帳_' and trashed = false and mimeType = 'application/vnd.google-apps.spreadsheet'`;
+    const books = (await g(`${DRIVE}?q=${encodeURIComponent(q)}&fields=files(id,name)`)).files.filter(f => /^経費精算台帳_\d{4}$/.test(f.name));
+    const local = await db.all(), byLink = new Map(local.filter(i => i.imageLink).map(i => [i.imageLink, i]));
+    const used = new Set(local.map(i => i.id));
+    let added = 0, removed = 0;
+    for (const b of books) {
+      const titles = (await sheetProps(b.id)).map(x => x.title).filter(t => /^\d{4}-\d{2}$/.test(t));
+      if (!titles.length) continue;
+      const res = await g(`${SHEETS}/${b.id}/values:batchGet?${titles.map(t => "ranges=" + encodeURIComponent(`'${t}'!A2:S`)).join("&")}&valueRenderOption=FORMATTED_VALUE`);
+      for (let ti = 0; ti < titles.length; ti++) {
+        const title = titles[ti], seen = new Set(), bookUrl = `https://docs.google.com/spreadsheets/d/${b.id}`;
+        for (const r of res.valueRanges[ti].values || []) {
+          const link = (r[13] ?? "").toString();
+          if (!link || seen.has(link)) continue;   // 画像リンクのない行は、修正・削除の目印がないので取り込まない
+          seen.add(link);
+          const data = rowToItem(r, title, b.id), li = byLink.get(link);
+          if (!li) {
+            let id = new Date((r[14] || "").toString().replace(" ", "T")).getTime(); if (!Number.isFinite(id)) id = Date.now();
+            while (used.has(id)) id++; used.add(id);
+            await db.put({ id, status: "done", data, image: null, imageLink: link, sheet: title, bookUrl }); added++;
+          } else if (li.status === "done" && ["date", "store_name", "total", "category", "currency"].some(k => li.data[k] !== data[k])) {
+            li.data = { ...li.data, ...data }; li.sheet = title; li.bookUrl = bookUrl; await db.put(li);   // 別の端末で直した内容を反映
+          }
+        }
+        for (const li of local)   // 台帳から消えた(別の端末で削除した等)送信済みの分は、履歴からも消す
+          if (li.status === "done" && li.sheet === title && li.imageLink && !seen.has(li.imageLink) && (!li.bookUrl || li.bookUrl.includes(b.id)))
+            { await db.del(li.id); removed++; }
+      }
+    }
+    if (manual) msg(`台帳と同じにしました(追加 ${added} 件・削除 ${removed} 件)`, "ok");
+    else if (added || removed) msg(`台帳の内容を履歴に反映しました(追加 ${added} 件・削除 ${removed} 件)`, "ok");
+    return added + removed;
+  } catch (e) {
+    if (manual) msg(e instanceof AuthError ? e.message : "台帳から読み込めませんでした: " + e.message, "err");
+    return 0;
+  } finally { pulling = false; await render(); }
+}
+
 // 送信の進み具合を画面に出すための受け口(送信前の確認画面が設定する)
 let onProgress = () => {};
 async function doSync() {
@@ -467,7 +530,7 @@ $("file").onchange = async e => {
     const data = await readReceipt(blob);
     const sec = ((performance.now() - t0) / 1000).toFixed(1);
     current = { blob, fxKey: "", fxSrc: "" }; setEditMode(false);
-    $("preview").src = URL.createObjectURL(blob);
+    showPreview(blob, "");
     for (const k of FIELDS) { $(k).value = data[k] ?? ""; $(k).classList.remove("low"); }
     if (!$("currency").value) $("currency").value = "THB";
     $("currency").value = $("currency").value.trim().toUpperCase();
@@ -484,11 +547,16 @@ function setEditMode(on) {
   $("btnSave").textContent = on ? "✅ 更新" : "✅ 保存";
 }
 // 履歴のレシートを開いて、修正・削除する(保存済みなら台帳の行にも反映)
+// 撮影した端末なら画像を表示。台帳から取り込んだ分は画像を持たないので、ドライブへのリンクを出す
+function showPreview(blob, link) {
+  $("preview").classList.toggle("hidden", !blob); $("imgLink").classList.toggle("hidden", !!blob || !link);
+  if (blob) $("preview").src = URL.createObjectURL(blob); else $("imgLink").href = link || "#";
+}
 async function openEdit(id, returnTo = "") {
   if (syncing) { msg("送信中です。終わってからお試しください", "info"); return; }
   const it = await db.get(id); if (!it) return;
-  current = { blob: it.image, editId: id, returnTo, fxKey: "", fxSrc: it.data.fx_src || "" };
-  $("preview").src = URL.createObjectURL(it.image);
+  current = { blob: it.image || null, editId: id, returnTo, fxKey: "", fxSrc: it.data.fx_src || "" };
+  showPreview(it.image, it.imageLink);
   for (const k of FIELDS) { $(k).value = it.data[k] ?? ""; $(k).classList.remove("low"); }
   current.fxKey = $("currency").value.trim().toUpperCase() + $("date").value.slice(0, 7);   // 開いただけで保存済みのレートを上書きしない
   setEditMode(true); show("viewReview"); refreshFx();
@@ -639,6 +707,7 @@ async function saveReview() {
   msg(`保存しました(未送信 ${n} 件)。続けて撮影するか、「確認して送信」を押してください`, "ok");
 }
 $("btnSync").onclick = openConfirm;
+$("btnPull").onclick = () => pullLedger(true);
 $("btnLogin").onclick = login;
 
 /* ---------- 設定 ---------- */
@@ -687,7 +756,8 @@ $("btnSettingsSave").onclick = () => {
   $("category").innerHTML = CATEGORIES.map(c => `<option>${c}</option>`).join("");
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
   const back = takeTokenFromHash();
-  processDeletes().then(n => { if (n) { msg(`削除・修正の待ちだった ${n} 件を台帳に反映しました`, "ok"); render(); } });
+  processDeletes().then(n => { if (n) { msg(`削除・修正の待ちだった ${n} 件を台帳に反映しました`, "ok"); render(); } })
+    .then(() => pullLedger());   // 開いたとき(ログイン中なら)、台帳の内容を履歴に反映する
   monthRate("JPY", monthKey(new Date().getFullYear(), new Date().getMonth())).catch(() => {});   // 新しい月の最初に開いたとき、今月の社内レートを自動で入れる
   await render();
   if (!ls.get("anthropic_key")) { msg("はじめに右上の ⚙︎ で Anthropic の API キーを入力してください", "info"); }

@@ -78,7 +78,7 @@
 
     <div class="card">
       <h2>履歴(この iPhone 内)</h2>
-      <p class="sub-text" style="margin:0 0 4px">行をタップすると、修正・削除できます</p>
+      <p class="sub-text" style="margin:0 0 4px">行をタップすると、修正・削除できます。<button id="btnPull" class="sub" style="padding:4px 10px;font-size:12px;margin-left:6px">台帳と同期</button></p>
       <div id="list"><small>まだありません</small></div>
     </div>
     <p style="text-align:center"><a id="sheetLink" href="#" target="_blank" class="hidden">📊 台帳スプレッドシートを開く</a></p>
@@ -98,6 +98,7 @@
   <section id="viewReview" class="hidden">
     <div class="card">
       <img id="preview" alt="">
+      <a id="imgLink" class="hidden" target="_blank" style="display:block;margin:6px 0">🖼 画像を開く(Google ドライブ)</a>
       <div class="grid2">
         <div><label>日付</label><input id="date" type="date"></div>
         <div><label>カテゴリ</label><select id="category"></select></div>

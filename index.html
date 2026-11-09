@@ -53,6 +53,7 @@
   summary span { font-size:13px; color:var(--sub); }
   details .item { padding-left:18px; }
   .tag { font-size:12px; padding:2px 8px; border-radius:99px; white-space:nowrap; align-self:center; }
+  .tag.err { background:#fdecea; color:var(--err); }
   .tag.pending, .tag.update { background:#fff3cd; color:#8a6d00; } .tag.done { background:#e6f4ec; color:var(--ok); }
   small, .sub-text { color:var(--sub); font-size:12px; }
   h2 { font-size:15px; margin:0 0 6px; }
@@ -88,6 +89,7 @@
       <h2>送信前の確認</h2>
       <p class="sub-text" style="margin:0 0 4px">内容を見て、間違いがあれば行をタップして修正・削除してください。</p>
       <div id="confirmList"></div>
+      <div id="confirmBar" class="hidden" style="height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin-top:12px"><div id="confirmBarIn" style="height:100%;width:0;background:var(--pri);transition:width .3s"></div></div>
       <p id="confirmSum" style="font-weight:600;margin:10px 0 0"></p>
       <div class="row"><button id="btnConfirmSend">送信</button><button class="sub" id="btnConfirmBack">戻る</button></div>
     </div>

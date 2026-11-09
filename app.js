@@ -171,7 +171,12 @@ function takeTokenFromHash() {
 
 async function g(url, opt = {}) {
   const t = token(); if (!t) throw new AuthError("Googleにログインしてください");
-  const r = await fetch(url, { ...opt, headers: { Authorization: "Bearer " + t, ...(opt.headers || {}) } });
+  // 通信が止まったまま進まなくならないよう、一定時間で打ち切る(画像の送信は長めに待つ)
+  const ac = new AbortController(), timer = setTimeout(() => ac.abort(), url.includes("/upload/") ? 90000 : 45000);
+  let r;
+  try { r = await fetch(url, { ...opt, signal: ac.signal, headers: { Authorization: "Bearer " + t, ...(opt.headers || {}) } }); }
+  catch (e) { throw new Error(ac.signal.aborted ? "通信がタイムアウトしました(電波の良い場所でもう一度)" : "通信できませんでした(ネットワークを確認してください)"); }
+  finally { clearTimeout(timer); }
   if (r.status === 401) { ls.del("g_token"); throw new AuthError("ログインの有効期限が切れました"); }
   const j = await r.json().catch(() => ({}));
   if (r.status === 403 && /insufficient authentication scopes/i.test(j.error?.message || "")) {
@@ -345,17 +350,33 @@ async function processDeletes() {
   for (const it of (await db.all()).filter(i => i.status === "update")) if (await applyUpdate(it)) n++;
   return n;
 }
+// 送信の進み具合を画面に出すための受け口(送信前の確認画面が設定する)
+let onProgress = () => {};
 async function doSync() {
   try {
     await processDeletes();
-    const pend = (await db.all()).filter(i => i.status === "pending").sort((a, b) => a.id - b.id);
+    // 確認画面の一覧と同じ順(日付の古い順)に、1件ずつ順番に送る
+    const pend = (await db.all()).filter(i => i.status === "pending")
+      .sort((a, b) => (a.data.date || "").localeCompare(b.data.date || "") || a.id - b.id);
     const t0 = performance.now();
+    let ok = 0, fail = 0;
     for (const p of pend) {
-      msg(`送信中… (${pend.indexOf(p) + 1}/${pend.length}) 画面を閉じずにお待ちください`, "info");
-      const it = await db.get(p.id);          // 直前に最新の状態を確認(他で送信済みなら飛ばす)
-      if (it && it.status === "pending") await sendItem(it);
+      const n = ok + fail + 1;
+      msg(`送信中… (${n}/${pend.length}) 画面を閉じずにお待ちください`, "info");
+      onProgress("run", p.id, ok + fail, pend.length);
+      try {
+        const it = await db.get(p.id);          // 直前に最新の状態を確認(他で送信済みなら飛ばす)
+        if (it && it.status === "pending") await sendItem(it);
+        ok++; onProgress("ok", p.id, ok + fail, pend.length);
+      } catch (e) {
+        const auth = e instanceof AuthError;
+        if (!auth) fail++;                         // ログイン切れ等は以降も送れないので中止し、それ以外の失敗は次のレシートに進む
+        onProgress("err", p.id, ok + fail, pend.length, e.message);
+        if (auth) throw e;
+      }
     }
-    if (pend.length) msg(`${pend.length}件を台帳に保存しました(${((performance.now() - t0) / 1000).toFixed(1)}秒)`, "ok");
+    if (pend.length) msg(fail ? `${ok}件を台帳に保存しました。${fail}件は送信できませんでした(一覧の ❌ を確認)`
+      : `${ok}件を台帳に保存しました(${((performance.now() - t0) / 1000).toFixed(1)}秒)`, fail ? "err" : "ok");
   } catch (e) {
     msg(e instanceof AuthError ? e.message : "送信できませんでした: " + e.message, "err");
   }
@@ -519,11 +540,27 @@ function warnOf(d, all) {
   if (all.filter(o => o.data.date === d.date && o.data.total === d.total).length > 1) w.push("重複?");
   return w;
 }
+let confirmTags = {}, ticker = null;
+// 送信中の1件ごとの状態を、確認画面の一覧に出す(送信中は経過秒数も動く)
+function progress(state, id, done, total, text) {
+  const t = confirmTags[id]; if (!t) return;
+  clearInterval(ticker);
+  const note = t.previousSibling && t.previousSibling.querySelector("small");
+  if (state === "run") {
+    const t0 = Date.now(); t.className = "tag update";
+    const upd = () => { t.textContent = `送信中… ${Math.floor((Date.now() - t0) / 1000)}秒`; }; upd(); ticker = setInterval(upd, 1000);
+    t.scrollIntoView({ block: "nearest" });
+  } else if (state === "ok") { t.className = "tag done"; t.textContent = "✅ 送信済み"; }
+  else { t.className = "tag err"; t.textContent = "❌ 失敗"; if (note && text && !note.textContent.includes(text)) note.textContent += ` ・ ${text}`; }
+  $("confirmBar").classList.remove("hidden"); $("confirmBarIn").style.width = `${Math.round(done / total * 100)}%`;
+  $("confirmSum").textContent = state === "run" ? `送信中 ${done + 1} / ${total} 件` : `${done} / ${total} 件 処理済み`;
+}
 async function openConfirm() {
   const pend = (await db.all()).filter(i => i.status === "pending")
     .sort((a, b) => (a.data.date || "").localeCompare(b.data.date || "") || a.id - b.id);
   if (!pend.length) { show("viewMain"); await render(); return; }
-  const box = $("confirmList"); box.textContent = "";
+  const box = $("confirmList"); box.textContent = ""; confirmTags = {};
+  $("confirmBar").classList.add("hidden"); $("confirmBarIn").style.width = "0";
   let sum = 0, bad = 0;
   for (const it of pend) {
     const d = it.data, w = warnOf(d, pend), thb = thbOf(d); sum += thb || 0; if (w.length) bad++;
@@ -533,7 +570,7 @@ async function openConfirm() {
     const sub = document.createElement("small"); sub.style.display = "block";
     sub.textContent = `${d.total ?? "-"} ${d.currency || ""}` + (isForeign(d.currency) && thb != null ? `(≈ ${thb.toLocaleString()} THB)` : "") + ` ・ ${d.category}`;
     l.append(sub);
-    const tag = document.createElement("span"); tag.className = "tag " + (w.length ? "pending" : "done");
+    const tag = document.createElement("span"); tag.className = "tag " + (w.length ? "pending" : "done"); confirmTags[it.id] = tag;
     tag.textContent = w.length ? "要確認: " + w.join("・") : "OK"; row.append(l, tag); box.append(row);
   }
   $("confirmSum").textContent = `${pend.length}件 ・ 合計 ${sum.toLocaleString(undefined, { maximumFractionDigits: 2 })} THB` + (bad ? ` ・ 要確認 ${bad}件` : "");
@@ -543,8 +580,12 @@ async function openConfirm() {
 $("btnConfirmBack").onclick = () => { show("viewMain"); msg(""); render(); };
 $("btnConfirmSend").onclick = async () => {
   if (!token()) { login(); return; }
-  await sync();   // sync の最後に画面を更新する
-  if ((await db.all()).some(i => i.status === "pending")) await openConfirm(); else show("viewMain");
+  onProgress = progress;
+  for (const b of ["btnConfirmBack"]) $(b).disabled = true;
+  try { await sync(); } finally { clearInterval(ticker); onProgress = () => {}; $("btnConfirmBack").disabled = false; }
+  // 失敗が残っているときは一覧のまま(❌の理由を見て、直すか、もう一度送信する)。全部送れたら、成功の表示を少し見せてからメイン画面へ
+  if (!(await db.all()).some(i => i.status === "pending")) { await new Promise(r => setTimeout(r, 1500)); show("viewMain"); }
+  else $("btnConfirmSend").textContent = "失敗した分をもう一度送信";
 };
 $("btnDelete").onclick = async () => {
   if (!current || !current.editId || $("btnDelete").disabled) return;
